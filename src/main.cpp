@@ -50,7 +50,7 @@ int main (int argc, char **argv){
 	int psender = 0, preciever = 0, pdtype = 0, pdvalue = 0;
 	opterr = 0;
 
-	while ((c = getopt (argc, argv, "t:x:s:r:d:v:c:n:?::h::")) != -1)
+	while ((c = getopt (argc, argv, "m:t:x:s:r:d:v:c:n:?::h::")) != -1)
 		switch (c)
 		{
 		case 'h':
