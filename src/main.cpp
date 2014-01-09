@@ -107,7 +107,7 @@ int main (int argc, char **argv){
 			abort ();
 		}
 
-	if(!psender || !preciever || !pdtype || !pdvalue || command != NULL){
+	if(!psender || !preciever || !pdtype || !pdvalue || command == NULL){
 		std::cout << "A parameter is missing, check your arguments" << std::endl;
 		show_usage();
 		return 0;
