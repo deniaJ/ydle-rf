@@ -18,39 +18,31 @@
 #include <wiringPi.h>
 #include "logging.h"
 #include "protocolRF.h"
+#include "LuaStack.h"
 
-
-// global pin used for emit
-int g_pinTx = 1;
-// global pin used for receive
-int g_pinRx = 0;
+pthread_mutex_t g_mutexSynchro = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP; // Mutex used to prevent reading RF when we Sending something
+int g_pinTx = 0;
+int g_pinRx = 1;
 protocolRF *g_ProtocolRF;
 
 void show_usage(){
-	std::cout << "Usage: ydle-rf -s [Sender] -r [Receiver] -d [Data type] -v [Data Value]" << std::endl;
-	std::cout << "Example : ydle-rf -s 1 -r 2 -d 4 -v 10" << std::endl;
+	std::cout << "Usage: ydle-rf -s script" << std::endl;
+	std::cout << "Example : ydle-rf -s script/init.lua" << std::endl;
 	std::cout << "Options: "<< std::endl;
 	std::cout << "Mandatory" << std::endl;
-	std::cout << " -s : Sender (integer) " << std::endl;
-	std::cout << " -r : Receiver (integer) " << std::endl;
-	std::cout << " -m : Command (integer) " << std::endl;
-	std::cout << " -d : Data type (integer, value: 1, 2, 3, 4, 5) " << std::endl;
-	std::cout << " -v : Data Value (integer) " << std::endl;
-	std::cout << "Optional" << std::endl;
-	std::cout << " -t : Transmiter pin (integer) " << std::endl;
-	std::cout << " -x : Receptor pin (integer) " << std::endl;
-	std::cout << " -n : Send n packet" << std::endl;
-	//std::cout << " -c : send false crc " << std::endl;
+	std::cout << " -s : Script (string) " << std::endl;
+	std::cout << "Optional:" << std::endl;
+	std::cout << " -x : Rx Pin (int) " << std::endl;
+	std::cout << " -t : Tx Pin (int) " << std::endl;
 }
-
 int main (int argc, char **argv){
-	char *sender, *receiver, *data_type, *data_value, *count = NULL, *crc = NULL, *tx_pin = NULL, *rx_pin = NULL, *command=NULL;
+	char *script, *receiver, *data_type, *data_value, *count = NULL, *crc = NULL, *tx_pin = NULL, *rx_pin = NULL, *command=NULL;
 	int send,rec, dtype, dvalue, cmd;
+	int pscript = 0;
 	int c;
-	int psender = 0, preciever = 0, pdtype = 0, pdvalue = 0;
 	opterr = 0;
 
-	while ((c = getopt (argc, argv, "m:t:x:s:r:d:v:c:n:?::h::")) != -1)
+	while ((c = getopt (argc, argv, "t:x:s:?::h::")) != -1)
 		switch (c)
 		{
 		case 'h':
@@ -58,40 +50,14 @@ int main (int argc, char **argv){
 			return 0;
 			break;
 		case 's':
-			sender = optarg;
-			send = atoi(sender);
-			psender = 1;
-			break;
-		case 'r':
-			receiver = optarg;
-			rec = atoi(receiver);
-			preciever = 1;
-			break;
-		case 'd':
-			data_type = optarg;
-			dtype = atoi(data_type);
-			pdtype = 1;
-			break;
-		case 'm':
-			command = optarg;
-			cmd = atoi(command);
-			break;
-		case 'v':
-			data_value = optarg;
-			dvalue = atoi(data_value);
-			pdvalue = 1;
+			script = optarg;
+			pscript = 1;
 			break;
 		case 'x':
 			rx_pin = optarg;
 			break;
 		case 't':
 			tx_pin = optarg;
-			break;
-		case 'c':
-			crc = optarg;
-			break;
-		case 'n':
-			count = optarg;
 			break;
 		case '?':
 			if (optopt == 'c')
@@ -107,14 +73,11 @@ int main (int argc, char **argv){
 			abort ();
 		}
 
-	if(!psender || !preciever || !pdtype || !pdvalue || command == NULL){
+	if(!pscript){
 		std::cout << "A parameter is missing, check your arguments" << std::endl;
 		show_usage();
 		return 0;
 	}
-	std::cout << sender;
-
-
 
 	pthread_t threadListenRF;
 	ydle::InitLogging(ydle::YDLE_LOG_DEBUG, ydle::YDLE_LOG_STDERR);
@@ -132,19 +95,29 @@ int main (int argc, char **argv){
 		g_pinRx = atoi(rx_pin);
 		g_pinTx = atoi(tx_pin);
 	}
-	g_ProtocolRF = new protocolRF(g_pinRx, g_pinTx);
 
-	int max = 1;
-	if(count != NULL){
-		YDLE_INFO << "Packets count: " << count << std::endl;
-		max = atoi(count);
+	ydle::LuaStack *stack;
+	stack = new ydle::LuaStack();
+
+	g_ProtocolRF = new protocolRF(g_pinRx, g_pinTx, stack);
+
+	struct sched_param p;
+	p.__sched_priority = sched_get_priority_max(SCHED_RR);
+	if (sched_setscheduler(0, SCHED_RR, &p) == -1) {
+		perror("Failed to switch to realtime scheduler.");
 	}
 
-	for(int i = 1; i <= max; i++ ){
-		g_ProtocolRF->dataToFrame(rec,send,cmd);
-		g_ProtocolRF->addData(dtype, dvalue);
-		g_ProtocolRF->transmit();
-		YDLE_INFO << "Send trame " << i;
+	stack->runScript(script);
+
+	// Start listen thread
+	if (pthread_create(&threadListenRF, NULL, protocolRF::listenSignal,
+			g_ProtocolRF) < 0) {
+		YDLE_FATAL << "Can't start ListenRF thread";
+	}
+	YDLE_DEBUG << "Everything is start!";
+
+	while(1){
+		sleep(100);
 	}
 
 	return 0;

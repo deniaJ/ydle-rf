@@ -3,19 +3,20 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include <sys/time.h>
+#include <time.h>
 #include <wiringPi.h>
 
 #include "logging.h"
 
-
-
 using namespace std;
 
-#define TIME_OUT_ACK  500000 //microsecondl
-namespace ydle{
+#define TIME_OUT_ACK  5000000 //microsecondl
 
-static unsigned char _atm_crc8_table[256] = {
+
+extern void scheduler_realtime();
+extern void scheduler_standard ();
+
+static uint8_t _atm_crc8_table[256] = {
 		0x00, 0x07, 0x0E, 0x09, 0x1C, 0x1B, 0x12, 0x15,
 		0x38, 0x3F, 0x36, 0x31, 0x24, 0x23, 0x2A, 0x2D,
 		0x70, 0x77, 0x7E, 0x79, 0x6C, 0x6B, 0x62, 0x65,
@@ -50,12 +51,21 @@ static unsigned char _atm_crc8_table[256] = {
 		0xE6, 0xE1, 0xE8, 0xEF, 0xFA, 0xFD, 0xF4, 0xF3
 };
 
-unsigned char  protocolRF::crc8(unsigned char* buf, int len)
+int protocolRF::getTime()
+{
+	struct timeval localTime;
+	//gettimeofday(&localTime, NULL);
+	int iTime=localTime.tv_sec * 1000000;
+	iTime+=localTime.tv_usec;
+	return iTime;
+}
+
+uint8_t  protocolRF::crc8(uint8_t* buf, int len)
 {
 	// The inital and final constants as used in the ATM HEC.
-	const unsigned char initial = 0x00;
-	const unsigned char final = 0x55;
-	unsigned char crc = initial;
+	const uint8_t initial = 0x00;
+	const uint8_t final = 0x55;
+	uint8_t crc = initial;
 	while (len) {
 		crc = _atm_crc8_table[(*buf ^ crc)];
 		buf++;
@@ -64,6 +74,27 @@ unsigned char  protocolRF::crc8(unsigned char* buf, int len)
 	return crc ^ final;
 }
 
+uint8_t protocolRF::computeCrc(Frame_t* frame){
+	uint8_t *buf, crc;
+	int a,j;
+
+	buf = (uint8_t*)malloc(frame->taille+3);
+	memset(buf, 0x0, frame->taille+3);
+
+	buf[0] = frame->sender;
+	buf[1] = frame->receptor;
+	buf[2] = frame->type << 5;
+	buf[2] |= frame->taille;
+
+	for(a=3, j=0 ;j < frame->taille - 1;a++, j++){
+		buf[a] = frame->data[j];
+	}
+	// message size = Sender (1byte) + receptor(1 byte) + type/size (1byte) + data/crc (size bytes)
+	// without crc : total size : 3 + taille - 1 = taille+2
+	crc = crc8(buf,frame->taille+2);
+	free(buf);
+	return crc;
+}
 
 //
 // ----------------------------------------------------------------------------
@@ -75,8 +106,9 @@ unsigned char  protocolRF::crc8(unsigned char* buf, int len)
 
  */
 // ----------------------------------------------------------------------------
-protocolRF::protocolRF(int rx, int tx)
+protocolRF::protocolRF(int rx, int tx, ydle::LuaStack* lua)
 {
+	this->lua = lua;
 	m_pinRx=rx;
 	m_pinTx=tx;
 
@@ -137,61 +169,33 @@ protocolRF::~protocolRF()
 // ----------------------------------------------------------------------------
 void protocolRF::initialisation()
 {
-
 	transmissionType = 0;
 	initializedState = false;
-
-
-
 	memset(start_bit2,0,sizeof(start_bit2));
 	start_bit2[1]=true;
 	start_bit2[6]=true;
-
-
 	debugActivated = false;
-
 	m_sample_value = 0;
-
 	sample_count = 1;
-
 	last_sample_value = 0;
-
 	pll_ramp = 0;
-
 	sample_sum = 0;
-
 	rx_bits = 0;
-
 	t_start = 0;
-
 	rx_active = 0;
-
 	speed = 1000;
-
 	t_per = 1000000/speed;
-
 	f_bit = t_per/8;
-
 	bit_value = 0;
-
 	bit_count = 0;
-
 	sender = 0;
-
 	receptor = 0;
-
 	type = 0;
-
 	parite = false;
-
 	taille = 0;
-
 	memset(m_data,0,sizeof(m_data));
-
 	rx_bytes_count = 0;
-
 	length_ok = 0;
-
 	m_rx_done = 0;
 }
 
@@ -207,16 +211,8 @@ void protocolRF::initialisation()
 // ----------------------------------------------------------------------------
 void protocolRF::sendPair(bool b) 
 {
-	if(b)
-	{
-		sendBit(true);
-		sendBit(false);
-	}
-	else
-	{
-		sendBit(false);
-		sendBit(true);
-	}
+	sendBit(b);
+	sendBit(!b);
 }
 
 
@@ -258,16 +254,19 @@ void protocolRF::sendBit(bool b)
 // ----------------------------------------------------------------------------
 void protocolRF::transmit(bool bRetransmit)
 {
-	int i = 0;
 	int j = 0;
 	int a = 0;
-
+	int i = 0;
+	uint8_t crc;
 	// calcul crc
-	m_sendframe.taille++; // add crc BYTE
-	m_sendframe.crc=crc8((unsigned char*)&m_sendframe,m_sendframe.taille+3);
 
-	itob(m_sendframe.sender,0,8);
-	itob(m_sendframe.receptor,8,8);
+	m_sendframe.taille++; // add crc BYTE
+	crc = computeCrc(&m_sendframe);
+	YDLE_DEBUG << "Send ACK";
+	m_sendframe.crc = crc;
+
+	itob(m_sendframe.receptor,0,8);
+	itob(m_sendframe.sender,8,8);
 	itob(m_sendframe.type,16,3);
 	itob(m_sendframe.taille,19,5);
 	for(a=0;a<m_sendframe.taille-1;a++)
@@ -277,33 +276,27 @@ void protocolRF::transmit(bool bRetransmit)
 
 	itob(m_sendframe.crc,24+(8*a),8);
 
-
-	printFrame(m_sendframe);
-
-	// If CMD then wait	 for ACK ONLY IF it's not already a re-retramit
-	if((m_sendframe.type==TYPE_CMD)&&(!bRetransmit))
-	{
-		struct timeval localTime;
+	// If CMD then wait	 for ACK ONLY IF it's not already a re-retransmit
+	if(m_sendframe.type == TYPE_CMD && !bRetransmit) {
 		ACKCmd_t newack;
 
 		memcpy(&newack.Frame,&m_sendframe,sizeof(Frame_t));
 		newack.iCount=0;
-		gettimeofday(&localTime, NULL); 
-		newack.Time=localTime.tv_sec * 1000000;
-		newack.Time+=localTime.tv_usec;
-		//ListACK.push_back(newack);
+		newack.Time = getTime();
+		mListACK.push_back(newack);
 	}
 
 	//Lock reception when we end something
-	//pthread_mutex_lock(&g_mutexSynchro);
+	pthread_mutex_lock(&g_mutexSynchro);
+
+//	scheduler_realtime();
+
 
 	// Sequence AGC
-	for (int x=0; x<16; x++)
+	for (int x=0; x < 32; x++)
 	{
-		digitalWrite(m_pinTx, HIGH);    // Pulse HIGH
-		delayMicroseconds(t_per);
-		digitalWrite(m_pinTx, LOW);	  // Pulse LOW
-		delayMicroseconds(t_per);
+		sendBit(true);
+		sendBit(false);
 	}
 
 	for (j=0; j<8; j++)
@@ -319,8 +312,141 @@ void protocolRF::transmit(bool bRetransmit)
 
 	digitalWrite(m_pinTx, LOW);
 
+//	scheduler_standard ();
+
+//SF		if(debugActivated) YDLE_DEBUG << ("end sending");
+
 	//unLock reception when we finished
-	//pthread_mutex_unlock(&g_mutexSynchro);
+	pthread_mutex_unlock(&g_mutexSynchro);
+}
+
+typedef short int16_t ;
+typedef unsigned short uint16_t ;
+//typedef unsigned long uint32_t ;
+
+
+union _FP32 {
+	uint32_t u;
+	float f;
+	struct {
+		uint32_t Mantissa : 23;
+		uint32_t Exponent : 8;
+		uint32_t Sign : 1;
+	};
+};
+
+union _FP16 {
+	uint16_t u;
+	struct {
+		uint16_t Mantissa : 10;
+		uint16_t Exponent : 5;
+		uint16_t Sign : 1;
+	};
+};
+
+static union _FP32 half_to_float_full(union _FP16 h)
+{
+	union _FP32 o = { 0 };
+
+	// From ISPC ref code
+	if (h.Exponent == 0 && h.Mantissa == 0) { // (Signed) zero
+		o.Sign = h.Sign;
+	}
+	else
+	{
+		if (h.Exponent == 0) // Denormal (will convert to normalized)
+		{
+			// Adjust mantissa so it's normalized (and keep track of exp adjust)
+			int e = -1;
+			uint32_t m = h.Mantissa;
+			do
+			{
+				e++;
+				m <<= 1;
+			} while ((m & 0x400) == 0);
+
+			o.Mantissa = (m & 0x3ff) << 13;
+			o.Exponent = 127 - 15 - e;
+			o.Sign = h.Sign;
+		}
+		else if (h.Exponent == 0x1f) // Inf/NaN
+		{
+			// NOTE: It's safe to treat both with the same code path by just truncating
+			// lower Mantissa bits in NaNs (this is valid).
+			o.Mantissa = int(h.Mantissa) << 13;
+			o.Exponent = 255;
+			o.Sign = h.Sign;
+		}
+		else // Normalized number
+		{
+			o.Mantissa = int(h.Mantissa) << 13;
+			o.Exponent = 127 - 15 + h.Exponent;
+			o.Sign = h.Sign;
+		}
+	}
+
+	return o;
+}
+
+static union _FP16 float_to_half_full(union _FP32 f)
+{
+	union _FP16 o = { 0 };
+
+	// Based on ISPC reference code (with minor modifications)
+	if (f.Exponent == 0) // Signed zero/denormal (which will underflow)
+		o.Exponent = 0;
+	else if (f.Exponent == 255) // Inf or NaN (all exponent bits set)
+	{
+		o.Exponent = 31;
+		o.Mantissa = f.Mantissa ? 0x200 : 0; // NaN->qNaN and Inf->Inf
+	}
+	else // Normalized number
+	{
+		// Exponent unbias the single, then bias the halfp
+		int newexp = f.Exponent - 127 + 15;
+		if (newexp >= 31) // Overflow, return signed infinity
+			o.Exponent = 31;
+		else if (newexp <= 0) // Underflow
+		{
+			if ((14 - newexp) <= 24) // Mantissa might be non-zero
+			{
+				uint16_t mant = f.Mantissa | 0x800000; // Hidden 1 bit
+				o.Mantissa = mant >> (14 - newexp);
+				if ((mant >> (13 - newexp)) & 1) // Check for rounding
+					o.u++; // Round, might overflow into exp bit, but this is OK
+			}
+		}
+		else
+		{
+			o.Exponent = newexp;
+			o.Mantissa = f.Mantissa >> 13;
+			if (f.Mantissa & 0x1000) // Check for rounding
+				o.u++; // Round, might overflow to inf, this is OK
+		}
+	}
+
+	o.Sign = f.Sign;
+	return o;
+}
+
+//TODO: Manque la gestion des erreurs!
+
+int protocolRF::extractData(int position, float & data){
+	union _FP16 half;
+	union _FP32 result;
+	int real_position = position * 2;
+	half.u =  (m_receivedframe.data[real_position] << 8) | m_receivedframe.data[real_position+1];
+	result = half_to_float_full(half);
+	data = result.f;
+	return 0;
+}
+
+int protocolRF::extractData(int position, int & data){
+	uint16_t b;
+	int real_position = position * 2;
+	b = (m_receivedframe.data[real_position] << 8) | m_receivedframe.data[real_position+1];
+	data = b;
+	return 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -334,7 +460,7 @@ void protocolRF::transmit(bool bRetransmit)
 
  */
 // ----------------------------------------------------------------------------
-int protocolRF::extractData(int index,int &itype,int &ivalue,unsigned char* pBuffer /*=NULL*/,int ilen /*=0*/)
+int protocolRF::extractData(int index,int &itype,int &ivalue,uint8_t* pBuffer /*=NULL*/,int ilen /*=0*/)
 {
 	uint8_t* ptr;
 	bool bifValueisNegativ=false;
@@ -360,7 +486,7 @@ int protocolRF::extractData(int index,int &itype,int &ivalue,unsigned char* pBuf
 
 	while (!bEndOfData)
 	{
-		itype=(unsigned char)*ptr>>4;
+		itype=(uint8_t)*ptr>>4;
 		bifValueisNegativ=false;
 
 		// This is a very ugly code :-( Must do something better
@@ -625,14 +751,14 @@ void protocolRF::pll()
 				if (bit_count < 16)
 				{
 					// Les 8 premiers bits de données
-					sender <<= 1;
-					sender |= bit_value;
+					receptor <<= 1;
+					receptor |= bit_value;
 				}
 				else if (bit_count < 32)
 				{
 					// Les 8 bits suivants
-					receptor <<= 1;
-					receptor |= bit_value;
+					sender <<= 1;
+					sender |= bit_value;
 				}
 				else if (bit_count < 38)
 				{
@@ -692,17 +818,19 @@ void protocolRF::pll()
 				m_receivedframe.type = type;
 				m_receivedframe.taille = rx_bytes_count;
 				memcpy(m_receivedframe.data,m_data,rx_bytes_count-1); // copy data len - crc
-				m_receivedframe.crc=0;
-				printFrame(m_receivedframe);
-				if(crc8((unsigned char*)&m_receivedframe,m_receivedframe.taille+3) != m_data[rx_bytes_count-1])
-				{	
+
+				// crc calcul
+				m_receivedframe.crc = computeCrc(&m_receivedframe);
+
+				if(m_data[rx_bytes_count-1] != m_receivedframe.crc) {
 					if(debugActivated)
-						YDLE_DEBUG << ("crc error!!!!!!!!!");
+						YDLE_WARN << "crc error !!!";
 				}
 				else
 				{
+					YDLE_DEBUG << "Packet received, passing to lua";
+					this->lua->dataReceived();
 					m_rx_done = true;
-					printFrame(m_receivedframe);
 				}
 				length_ok = 0;
 				sender = 0;
@@ -740,88 +868,109 @@ void protocolRF::pll()
 //thread reading RX PIN
  */
 // ----------------------------------------------------------------------------
-void* protocolRF::listenSignal(void* pParam)
+void protocolRF::listenSignal()
 {
 	int err = 0;
+	//scheduler_realtime();
+	timespec time;
+
+	while(1)
+	{
+		// Si le temps est atteint, on effectue une mesure (sample) puis on appelle la PLL
+		//  *-------  1 CAS, on calcul le temps a attendre entre 2 lecture ------
+		int tempo=(t_start + (sample_count * f_bit)) -micros() -2;
+
+		if(tempo<5) {
+			tempo=5; // la fonction delayMicroseconds n'aime pas la valeur negative
+		}
+		time.tv_sec = 0;
+		time.tv_nsec = tempo * 1000;
+		nanosleep(&time, NULL);
+
+		// try to received ONLY if we are not currently sending something
+		err=pthread_mutex_lock(&g_mutexSynchro);
+		if( err== 0)
+		{
+			if(isDone())
+			{
+				setDone(false);
+			}
+
+			m_sample_value = digitalRead(m_pinRx);
+
+			pll();
+
+
+			// if a full signal is received
+			if(isDone())
+			{
+				// If it's a ACK then handle it
+				if(m_receivedframe.type == TYPE_ACK)
+				{
+					std::list<protocolRF::ACKCmd_t>::iterator i;
+					for(i=mListACK.begin(); i != mListACK.end(); ++i)
+					{
+						if(m_receivedframe.sender == i->Frame.receptor
+								&& m_receivedframe.receptor == i->Frame.sender)
+						{
+							YDLE_DEBUG << "Remove ACK from pending list";
+							i=mListACK.erase(i);
+							break; // remove only one ACK at a time.
+						}
+					}
+				}
+				else if(m_receivedframe.type == TYPE_ETAT_ACK)
+				{
+					// Send ACK
+					dataToFrame(m_receivedframe.sender,m_receivedframe.receptor,TYPE_ACK);
+					delay (250);
+					// Sequence AGC supplémentaire nécessaire
+					for (int x=0; x < 32; x++)
+					{
+						sendBit(true);
+						sendBit(false);
+					}
+					transmit(0);
+					//TODO: Ajout d'un wrapper
+				}
+				else //else send it to IHM
+				{
+					YDLE_DEBUG << "New frame ready to be sent :";
+					printFrame(m_receivedframe);
+					// TODO: Ajout d'un wrapper ?
+					//AddToListCmd(m_receivedframe);
+				}
+			}
+
+			// Let's Send thread
+			pthread_mutex_unlock(&g_mutexSynchro);
+		}
+		else
+		{
+			YDLE_WARN << "error acquire mutex" << err;
+		}
+		// check if we need re-transmit
+		checkACK();
+	}
+	// Code jamais atteint....
+	scheduler_standard();
+}
+
+void* protocolRF::listenSignal(void* pParam)
+{
 	YDLE_DEBUG << "Enter in thread listen";
 	protocolRF* parent=(protocolRF*)pParam;
 
+//	scheduler_realtime();
+
 	if (pParam)
 	{
-		while(1)
-		{
-			// Si le temps est atteint, on effectue une mesure (sample) puis on appelle la PLL
-			//  *-------  1 CAS, on calcul le temps a attendre entre 2 lecture ------
-			int tempo=(parent->t_start + (parent->sample_count * parent->f_bit)) -micros() -2;
-
-			if(tempo<5) tempo=5; // la fonction delayMicroseconds n'aime pas la valeur negative
-
-			delayMicroseconds(tempo);
-
-			// try to received ONLY if we are not currently sending something
-			//err=pthread_mutex_lock(&g_mutexSynchro);
-			if( err== 0)
-			{
-				if(parent->isDone())
-				{
-					parent->setDone(false);
-				}
-
-				parent->m_sample_value = digitalRead(parent->m_pinRx);
-
-				parent->pll();
-
-
-				// if a full signal is received
-				if(parent->isDone())
-				{
-					// If it's a ACK then tread it
-					if(parent->m_receivedframe.type == TYPE_ACK)
-					{
-						//std::list<protocolRF::ACKCmd_t>::iterator i;
-
-						/*for(i=ListACK.begin(); i != ListACK.end(); ++i)
-						{
-							if((parent->m_receivedframe.sender==(*i).Frame.sender)&&(parent->m_receivedframe.receptor==(*i).Frame.receptor))
-							{
-								YDLE_DEBUG << "Remove ACK for pending list";
-								i=ListACK.erase(i);
-								break; // remove only one ACK at a time.
-							}
-						}*/
-					}
-					else if(parent->m_receivedframe.type == TYPE_ETAT_ACK)
-					{
-						// Send ACK
-						parent->dataToFrame(parent->m_receivedframe.sender,parent->m_receivedframe.receptor,TYPE_ACK);
-						parent->transmit();
-						//AddToListCmd(parent->m_receivedframe);
-						YDLE_DEBUG << "Add packet";
-						parent->printFrame(parent->m_receivedframe);
-						//parent->ListCmd->push_back(parent->m_receivedframe);
-					}
-					else //else send it to IHM
-					{
-						//AddToListCmd(parent->m_receivedframe);
-						YDLE_DEBUG << "Add packet";
-						parent->printFrame(parent->m_receivedframe);
-						//parent->ListCmd->push_back(parent->m_receivedframe);
-					}
-				}
-
-				// Let's Send thread
-				//pthread_mutex_unlock(&g_mutexSynchro);
-			}
-			else
-			{
-				YDLE_WARN << "error acquire mutex" << err;
-			}
-			// check if we need re-transmit
-			checkACK(parent);
-		}	
-
+		parent->listenSignal() ;
 	}
 	YDLE_INFO << "Exit of thread listen";
+
+//	scheduler_standard ();
+
 	return NULL;
 }
 
@@ -863,12 +1012,8 @@ void protocolRF::itob(unsigned long integer, int start, int length)
 {
 	for (int i=0; i<length; i++)
 	{
-		if ((integer / power2(length-1-i))==1)
-		{
-			integer -= power2(length-1-i);
-			m_FrameBits[start + i]=1;
-		}
-		else m_FrameBits[start + i]=0;
+		int pow2 = 1 << (length-1-i) ;
+		m_FrameBits[start + i] = ((integer & pow2) != 0);
 	}
 }
 
@@ -886,13 +1031,12 @@ void protocolRF::itob(unsigned long integer, int start, int length)
 // ----------------------------------------------------------------------------
 void protocolRF::dataToFrame(unsigned long Receiver, unsigned long Transmitter, unsigned long type)
 {
+	memset(m_sendframe.data,0,sizeof(m_sendframe.data));
 	m_sendframe.sender=Transmitter;
 	m_sendframe.receptor=Receiver;
 	m_sendframe.type=type;
 	m_sendframe.taille=0;
 	m_sendframe.crc=0;
-	memset(m_sendframe.data,0,sizeof(m_sendframe.data));
-
 } 
 
 
@@ -905,7 +1049,7 @@ void protocolRF::dataToFrame(unsigned long Receiver, unsigned long Transmitter, 
 	   // log Frame
  */
 // ----------------------------------------------------------------------------
-void protocolRF::printFrame(Frame_t trame)
+void protocolRF::printFrame(Frame_t & trame)
 {
 	// if debug
 	if(debugActivated)
@@ -987,7 +1131,7 @@ int protocolRF::getTaille()
 	   // 
  */
 // ----------------------------------------------------------------------------
-unsigned char* protocolRF::getData()
+uint8_t* protocolRF::getData()
 {
 	return m_receivedframe.data;
 }
@@ -1048,38 +1192,34 @@ bool protocolRF::isDone()
     Check if CMD command was not received there ACK. retry if needed
  */
 // ----------------------------------------------------------------------------
-void protocolRF::checkACK(protocolRF* parent)
+void protocolRF::checkACK()
 {
-	/*if(!ListACK.empty())
-	{
+	if(!mListACK.empty()) {
 		std::list<protocolRF::ACKCmd_t>::iterator i;
 
-		struct timeval localTime;
-		gettimeofday(&localTime, NULL); 
-		int iTime=localTime.tv_sec * 1000000;
-		iTime+=localTime.tv_usec;
+		int iTime = getTime() ;
 
-		for(i=ListACK.begin(); i != ListACK.end(); ++i)
+		for(i=mListACK.begin(); i != mListACK.end(); ++i)
 		{
-			if ( (iTime-(*i).Time > TIME_OUT_ACK) || ((*i).Time>iTime) )
+			if ( (iTime - i->Time) > TIME_OUT_ACK ||  i->Time > iTime )
 			{
-				YDLE_WARN << "Ack not receive from receptor: " << (*i).Frame.receptor;
+				YDLE_WARN << "Ack not receive from receptor: " << (int)i->Frame.receptor;
 				// if more than 2 retry, then remove it
-				if((*i).iCount >=2)
+				if( i->iCount >=2)
 				{
 					YDLE_WARN << "ACK never received.";
-					i=ListACK.erase(i);		// TODO : Send IHM this error
+					i=mListACK.erase(i);		// TODO : Send IHM this error
 				}
 				else
 				{
-					memcpy(&parent->m_sendframe,&(*i).Frame,sizeof(Frame_t));
-					parent->m_sendframe.taille--; // remove CRC.It will be add in the transmit function
-					(*i).Time=iTime;
-					(*i).iCount++;
-					parent->transmit(true);	// re-Send frame;
+					memcpy(&m_sendframe, &i->Frame,sizeof(Frame_t));
+					m_sendframe.taille--; // remove CRC.It will be add in the transmit function
+					i->Time=iTime;
+					i->iCount++;
+					transmit(true);	// re-Send frame;
 				}
 			}
 		}
-	}*/
+	}
 }
-};
+
